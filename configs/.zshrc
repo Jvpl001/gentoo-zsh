@@ -23,7 +23,7 @@ zstyle ':completion:*' matcher-list 'm:{a-zA-Z}={A-Za-z}' 'r:|=*' 'l:|=* r:|=*'
 # 3. HISTORY SUBSTRING SEARCH (Local & Fast)
 # ==============================================================================
 # Source the file directly from your local home directory
-[[ -f ~/.zsh/plugins/zsh-history-substring-search.zsh ]] && source ~/.zsh/plugins/zsh-history-substring-search.zsh
+source ~/.zsh/plugins/zsh-history-substring-search.zsh
 
 # st terminal sends different escape sequences for arrow keys. We bind BOTH.
 bindkey '^[[A' history-substring-search-up   # Standard Up
@@ -211,6 +211,9 @@ alias emerge='doas emerge -v'
 alias sync='doas emerge --sync'
 alias search='\emerge -s'
 alias pretend='\emerge -pv'
+
+alias shutdown='doas shutdown -hP now'
+alias reboot='doas reboot'
 
 # 1. Directory Navigation
 setopt AUTO_CD           # Type a directory name to cd into it automatically (no 'cd' needed)
