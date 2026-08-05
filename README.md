@@ -273,3 +273,20 @@ This architecture completely eliminates the need for bloated frameworks like Oh 
 
 2. **After Modifying Configs:** If you edit your `.zshrc` to add a new alias or change a color, simply run `zsh-compile`. The script handles the bytecode compilation and cleans up the mess.
 3. **After System Updates:** When you run an `emerge` update that installs new software, run `zsh-system-compile`. It will optimize the newly installed Gentoo completions, rebuild your local cache, and ensure the `<TAB>` key remains instantaneous.
+
+## 8. The Automated Installer (`zsh_install.sh`)
+
+If you prefer not to configure the system manually or want to deploy this setup quickly, you can run the included `zsh_install.sh` script. It is a highly portable, deterministic UNIX shell script that automates the entire deployment process securely. 
+
+Here is what it handles under the hood:
+* **Cryptographic Verification:** The script establishes an isolated, no-exec `tmpfs` workspace in memory. It then independently pulls the developer's public GPG key from GitHub, compares the fingerprint against a hardcoded anchor, and verifies the SHA256 checksums of all source files before any installation begins.
+* **Self-Updating:** Before running, the script checks the remote repository for a newer, signed version of itself and safely restarts if an update is found.
+* **Privilege Segregation:** The script enforces being run as a standard user. It handles all local user configurations normally, only escalating privileges (via `doas` or `sudo`) exactly when needed to write to `/etc/` or invoke Portage.
+* **Non-Destructive Deployment:** Every existing configuration file that the script replaces is automatically preserved as a timestamped `.old` backup.
+* **Dry-Run Mode:** You can pass the `--dry-run` flag to safely audit exactly what files the script will create or modify without making any actual changes to your system.
+
+---
+
+## Credits & Acknowledgments
+
+* **[zsh-history-substring-search](https://github.com/zsh-users/zsh-history-substring-search)** — Vendored under the [BSD 3-Clause License](configs/plugins/zsh-history-substring-search.zsh). Copyright (c) 2009 Peter Stephenson, Guido van Steen, Suraj N. Kurapati, Sorin Ionescu, Vincent Guerci, Geza Lore, Bengt Brodersen.
