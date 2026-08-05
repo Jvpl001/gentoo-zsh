@@ -1,25 +1,29 @@
 #!/bin/sh
-# gentoo-zsh 0.0.1
+# gentoo-zsh 0.0.2
 # Portable UNIX shell with deterministic behavior.
 
 set -eu
 
-VERSION=0.0.1
+VERSION=0.0.2
 REPO_URL=${REPO_URL:-https://github.com/jvpl001/gentoo-zsh.git}
 RAW_URL=${RAW_URL:-https://raw.githubusercontent.com/jvpl001/gentoo-zsh/main}
 REPO_DIR=${REPO_DIR:-"$HOME/git/gentoo-zsh"}
 RELEASE_KEY_FPR=${RELEASE_KEY_FPR:-3AE1C31BCB1BA4E28D03999292B34C8F075C2F93}
 STATE_DIR=${XDG_STATE_HOME:-"$HOME/.local/state"}/gentoo-zsh
 LOG_FILE=$STATE_DIR/install.log
+GH_ANCHOR_USER=${GITHUB_USER:-}
+ALLOW_INSECURE_TMP=${GZ_ALLOW_INSECURE_TMP:-0}
 
-readonly VERSION REPO_URL RAW_URL REPO_DIR RELEASE_KEY_FPR STATE_DIR LOG_FILE
+readonly VERSION REPO_URL RAW_URL REPO_DIR RELEASE_KEY_FPR STATE_DIR LOG_FILE ALLOW_INSECURE_TMP
 
 DRY_RUN=0
 NO_UPDATE=${GZ_SKIP_SELF_UPDATE:-0}
 ELEVATE=
 SOURCE_DIR=
 TMP_DIR=
+TMP_MOUNTED=0
 GNUPGHOME=
+SHELL_CHANGED=1
 
 C_RED= C_GREEN= C_YELLOW= C_BLUE= C_MAGENTA= C_CYAN= C_FG= C_DIM= C_BOLD= C_RESET=
 
@@ -99,7 +103,10 @@ stage() {
 ################################
 
 cleanup() {
-  [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR"
+  if [ "$TMP_MOUNTED" -eq 1 ] && [ -n "${TMP_DIR:-}" ]; then
+    "$ELEVATE" umount "$TMP_DIR" >/dev/null 2>&1 || :
+  fi
+  [ -n "${TMP_DIR:-}" ] && [ -d "$TMP_DIR" ] && rm -rf "$TMP_DIR" 2>/dev/null || :
 }
 
 on_signal() {
@@ -117,6 +124,7 @@ check_core_dependencies() { need awk sed grep cut tr cmp mkdir cp mv chmod id da
 require_network() { need git curl; }
 require_crypto() { need sha256sum gpg; }
 require_gentoo() { need emerge; }
+require_mount() { need mount umount; }
 
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -139,17 +147,6 @@ setup_logging() {
   : >"$LOG_FILE" || fatal "cannot write log: $LOG_FILE"
 }
 
-setup_tmp() {
-  TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gentoo-zsh.XXXXXX") || fatal 'cannot create temporary directory'
-}
-
-setup_gpg() {
-  GNUPGHOME=$TMP_DIR/gnupg
-  mkdir -m 700 "$GNUPGHOME" || fatal 'cannot create temporary GnuPG home'
-  export GNUPGHOME
-  readonly GNUPGHOME
-}
-
 setup() {
   umask 077
   setup_logging
@@ -157,12 +154,40 @@ setup() {
   [ "$(id -u)" -ne 0 ] || fatal 'installer must be run as a normal user (not root)'
   check_core_dependencies
   [ -n "$RELEASE_KEY_FPR" ] || fatal 'release-key fingerprint is not configured'
-  setup_tmp
-  setup_gpg
 
   status INFO "gentoo-zsh $VERSION"
   status INFO "log: $LOG_FILE"
   [ "$DRY_RUN" -eq 0 ] || warn 'dry run: no system or user files will be changed'
+}
+
+setup_secure_tmp() {
+  TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/gentoo-zsh.XXXXXX") || fatal 'cannot create temporary directory'
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    status INFO "verification workspace (ordinary, dry run): $TMP_DIR"
+    return 0
+  fi
+
+  require_mount
+  if run_elevated mount -t tmpfs -o "size=128m,mode=0700,uid=$(id -u),gid=$(id -g),noexec,nosuid,nodev" tmpfs "$TMP_DIR"; then
+    TMP_MOUNTED=1
+    ok "verification workspace is an isolated, memory-only, noexec mount: $TMP_DIR"
+    return 0
+  fi
+
+  if [ "$ALLOW_INSECURE_TMP" -eq 1 ]; then
+    warn "tmpfs mount failed; continuing on ordinary disk because GZ_ALLOW_INSECURE_TMP=1"
+    return 0
+  fi
+
+  fatal "could not mount a hardened tmpfs at $TMP_DIR — refusing to verify or extract release files on ordinary disk (set GZ_ALLOW_INSECURE_TMP=1 to override)"
+}
+
+setup_gpg() {
+  GNUPGHOME=$TMP_DIR/gnupg
+  mkdir -m 700 "$GNUPGHOME" || fatal 'cannot create temporary GnuPG home'
+  export GNUPGHOME
+  readonly GNUPGHOME
 }
 
 fetch() {
@@ -191,6 +216,7 @@ deploy_file() {
 
   stamp=$(date +%Y%m%d-%H%M%S)
   dest_dir=${dest%/*}
+  stage_file=$dest_dir/.$(basename "$dest").new.$stamp
 
   if [ "$elevated" -eq 1 ]; then
     run_elevated mkdir -p "$dest_dir"
@@ -198,14 +224,16 @@ deploy_file() {
       run_elevated cp -p "$dest" "$dest.old.$stamp"
       warn "preserved previous file as $dest.old.$stamp"
     fi
-    run_elevated cp "$src" "$dest"
+    run_elevated cp "$src" "$stage_file"
+    run_elevated mv -f "$stage_file" "$dest"
   else
     run mkdir -p "$dest_dir"
     if [ -f "$dest" ] || [ -L "$dest" ]; then
-      run mv "$dest" "$dest.old.$stamp"
+      run cp -p "$dest" "$dest.old.$stamp"
       warn "preserved previous file as $dest.old.$stamp"
     fi
-    run cp "$src" "$dest"
+    run cp "$src" "$stage_file"
+    run mv -f "$stage_file" "$dest"
   fi
 
   [ "$DRY_RUN" -eq 1 ] || cmp -s "$src" "$dest" || fatal "post-copy verification failed: $dest"
@@ -218,6 +246,48 @@ deploy_file() {
 
 normalize_fingerprint() {
   printf '%s' "$1" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]'
+}
+
+github_user() {
+  [ -z "$GH_ANCHOR_USER" ] || {
+    printf '%s\n' "$GH_ANCHOR_USER"
+    return 0
+  }
+  printf '%s\n' "$REPO_URL" |
+    sed -n \
+      -e 's#^https\{0,1\}://github\.com/\([^/]*\)/.*#\1#p' \
+      -e 's#^git@github\.com:\([^/]*\)/.*#\1#p'
+}
+
+verify_github_anchor() {
+  gh_user=$(github_user)
+  if [ -z "$gh_user" ]; then
+    warn 'could not determine a GitHub username from REPO_URL — skipping the independent key anchor check'
+    return 0
+  fi
+
+  anchor=$TMP_DIR/github-account.gpg
+  if ! fetch "https://github.com/$gh_user.gpg" "$anchor" "GitHub account public key ($gh_user)"; then
+    warn 'could not reach github.com to independently confirm the release key — proceeding on the pinned fingerprint alone'
+    return 0
+  fi
+  [ -s "$anchor" ] || {
+    warn "github.com/$gh_user.gpg returned nothing — skipping the independent key anchor check"
+    return 0
+  }
+
+  anchor_fpr=$(gpg --batch --quiet --with-colons --import-options show-only --import "$anchor" 2>/dev/null |
+    awk -F: '$1=="fpr" {print $10; exit}')
+  if [ -z "$anchor_fpr" ]; then
+    warn "github.com/$gh_user.gpg had no readable fingerprint — skipping the independent key anchor check"
+    return 0
+  fi
+
+  expected=$(normalize_fingerprint "$RELEASE_KEY_FPR")
+  actual=$(normalize_fingerprint "$anchor_fpr")
+  [ "$actual" = "$expected" ] ||
+    fatal "the key GitHub publishes for $gh_user does not match the pinned release fingerprint — refusing to continue"
+  ok "pinned fingerprint independently confirmed against github.com/$gh_user.gpg"
 }
 
 import_release_key() {
@@ -257,6 +327,7 @@ verify_release() {
   require_crypto
   [ -d "$root" ] || fatal "source tree is unavailable: $root"
   import_release_key "$key"
+  verify_github_anchor
   verify_signature "$manifest" "$signature"
   (cd "$root" && sha256sum -c security/sha256sums.txt >/dev/null 2>&1) ||
     fatal "SHA256 verification failed: $root"
@@ -271,6 +342,7 @@ source_tree_present() {
     [ -f "$root/installer/zsh_install.sh" ] &&
     [ -f "$root/configs/.zshrc" ] &&
     [ -f "$root/configs/fastfetch/config.jsonc" ] &&
+    [ -f "$root/configs/plugins/zsh-history-substring-search.zsh" ] &&
     [ -f "$root/portage/clang_flto.conf" ] &&
     [ -f "$root/VERSION" ]
 }
@@ -303,6 +375,7 @@ self_update() {
   fi
 
   import_release_key "$update/security/release-key.asc"
+  verify_github_anchor
   verify_signature "$update/security/sha256sums.txt" "$update/security/sha256sums.txt.asc"
 
   expected=$(awk '$2=="installer/zsh_install.sh" || $2=="VERSION" {print; found[$2]=1} END {if (!found["installer/zsh_install.sh"] || !found["VERSION"]) exit 1}' \
@@ -347,19 +420,19 @@ clone_repository() {
   target=$1
   require_network
 
+  staging=$TMP_DIR/repository
+  git clone --quiet "$REPO_URL" "$staging" || fatal 'git clone failed'
+  source_tree_present "$staging" || fatal 'repository missing release files'
+  verify_release "$staging"
+
   if [ "$DRY_RUN" -eq 1 ]; then
-    SOURCE_DIR=$TMP_DIR/repository
-    git clone --quiet "$REPO_URL" "$SOURCE_DIR" || fatal 'git clone failed'
-    source_tree_present "$SOURCE_DIR" || fatal 'repository missing release files'
-    verify_release "$SOURCE_DIR"
     status INFO "verified remote repository; would install at $target"
+    SOURCE_DIR=$staging
     return 0
   fi
 
   mkdir -p "${target%/*}" || fatal "cannot create parent directory: ${target%/*}"
-  git clone --quiet "$REPO_URL" "$target" || fatal 'git clone failed'
-  source_tree_present "$target" || fatal 'repository missing release files'
-  verify_release "$target"
+  mv "$staging" "$target" || fatal "cannot move verified repository into place: $target"
   SOURCE_DIR=$target
 }
 
@@ -418,7 +491,7 @@ privileges() {
   if [ "$DRY_RUN" -eq 0 ]; then
     "$ELEVATE" true || fatal "$ELEVATE authentication failed"
   fi
-  ok "privileged operations grouped through $ELEVATE"
+  ok "using $ELEVATE for privileged operations"
 }
 
 root_phase() {
@@ -454,16 +527,12 @@ user_phase() {
 
   plugin_dir=$HOME/.zsh/plugins
   plugin=$plugin_dir/zsh-history-substring-search.zsh
-  plugin_tmp=$TMP_DIR/zsh-history-substring-search.zsh
+  plugin_src=$SOURCE_DIR/configs/plugins/zsh-history-substring-search.zsh
 
   run mkdir -p "$plugin_dir" || fatal "cannot create plugin directory: $plugin_dir"
 
-  fetch "https://raw.githubusercontent.com/zsh-users/zsh-history-substring-search/master/zsh-history-substring-search.zsh" \
-    "$plugin_tmp" "zsh-history-substring-search plugin" ||
-    fatal 'history plugin download failed'
-
-  [ "$DRY_RUN" -eq 1 ] || zsh -n "$plugin_tmp" || fatal 'history plugin failed zsh syntax validation'
-  deploy_file "$plugin_tmp" "$plugin" 0
+  [ "$DRY_RUN" -eq 1 ] || zsh -n "$plugin_src" || fatal 'history plugin failed zsh syntax validation'
+  deploy_file "$plugin_src" "$plugin" 0
 
   ok 'user configuration deployed'
 }
@@ -487,8 +556,15 @@ shell_phase() {
 
   current=$(getent passwd "$(id -un)" | cut -d: -f7) || fatal 'cannot determine current login shell'
   if [ "$current" != "$zsh_path" ]; then
-    run_elevated chsh -s "$zsh_path" "$(id -un)" || fatal 'cannot change login shell'
-    ok "login shell changed to $zsh_path"
+    if run_elevated chsh -s "$zsh_path" "$(id -un)"; then
+      ok "login shell changed to $zsh_path"
+    else
+      SHELL_CHANGED=0
+      warn "chsh failed — your login shell is still $current, not $zsh_path"
+      warn "chsh sometimes wants its own confirmation on top of $ELEVATE, or refuses to run non-interactively through it. Try by hand:"
+      warn "  chsh -s $zsh_path              (self-service, prompts for your own password)"
+      warn "  $ELEVATE chsh -s $zsh_path $(id -un)   (if the above refuses)"
+    fi
   else
     ok "login shell is already $zsh_path"
   fi
@@ -533,17 +609,24 @@ finish() {
   printf '\n%s%s== GENTOO-ZSH %s INSTALLED ==%s\n\n' "$C_BOLD" "$C_GREEN" "$VERSION" "$C_RESET"
   status INFO "repository kept at $REPO_DIR"
   status INFO 'existing files were preserved as timestamped backups'
-  status INFO 'log out and back in, or run: exec zsh'
+  if [ "$SHELL_CHANGED" -eq 1 ]; then
+    status INFO 'log out and back in, or run: exec zsh'
+  else
+    status WARNING 'chsh did not succeed — see the shell handover warning above before you log out'
+  fi
 }
 
 main() {
   setup
+  privileges
+  setup_secure_tmp
+  setup_gpg
+
   printf '%s%sGENTOO-ZSH%s\n' "$C_BOLD" "$C_FG" "$C_RESET"
   status INFO 'signed manifest / clang + lld / full LTO'
 
   self_update
   choose_source
-  privileges
   root_phase
   user_phase
   shell_phase
